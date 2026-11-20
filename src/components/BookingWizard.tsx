@@ -1,0 +1,1631 @@
+import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { createPortal } from 'react-dom';
+import { Service, Appointment, TimeSlotConfig, BlacklistEntry, StudioAddressConfig, PaymentConfig, RecurrenceConfig, DayScheduleConfig } from '../types';
+import {
+  buildOfficialWhatsAppUrl,
+  calculateDeposit40,
+  calculateFullPrepayment,
+  calculateRemainingBalance,
+  formatBRL,
+  areDatesEqual
+} from '../services/notificationTemplates';
+import {
+  parseDurationMinutes,
+  calculateProcedureDuration,
+  calculateEndTime,
+  OFFICIAL_DURATION_MISSING_ERROR
+} from '../services/durationService';
+import { triggerNewPreBookingEmailNotification, lookupPublicClientByPhone, fetchPublicAvailability } from '../services/emailNotificationService';
+
+interface BookingWizardProps {
+  selectedService: Service;
+  onBookingConfirmed: (newApt: Appointment) => void;
+  onClose?: () => void;
+  timeSlots?: TimeSlotConfig[];
+  blacklist?: BlacklistEntry[];
+  studioAddress?: StudioAddressConfig;
+  paymentConfig?: PaymentConfig;
+  services?: Service[];
+  onSelectService?: (service: Service) => void;
+  appointments?: Appointment[];
+  blockedDates?: string[];
+  daySchedules?: DayScheduleConfig[];
+}
+
+export const BookingWizard: React.FC<BookingWizardProps> = ({
+  selectedService,
+  onBookingConfirmed,
+  onClose,
+  timeSlots = [],
+  blacklist = [],
+  studioAddress = { street: '', number: '', neighborhood: '', city: '', state: '', fullAddress: '', mapsUrl: '', wazeUrl: '' },
+  paymentConfig = { pixKey: '', pixBeneficiary: '', depositAmount: 40 },
+  services = [],
+  onSelectService,
+  appointments = [],
+  blockedDates = [],
+  daySchedules
+}) => {
+  // Booking dates must follow the studio's timezone, not the customer's device timezone.
+  // This avoids showing yesterday/tomorrow when the customer is outside Brazil.
+  const getStudioToday = () => {
+    const parts = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'America/Sao_Paulo',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit'
+    }).formatToParts(new Date());
+    const part = (type: string) => parts.find(item => item.type === type)?.value || '';
+    return new Date(Number(part('year')), Number(part('month')) - 1, Number(part('day')));
+  };
+  const today = getStudioToday();
+  const toDateKey = (date: Date) => `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+  const [selectedDate, setSelectedDate] = useState<string>(() => toDateKey(getStudioToday()));
+  const [visibleMonth, setVisibleMonth] = useState<Date>(() => {
+    const studioToday = getStudioToday();
+    return new Date(studioToday.getFullYear(), studioToday.getMonth(), 1);
+  });
+  const [selectedTime, setSelectedTime] = useState<string>('');
+  const [bookingStep, setBookingStep] = useState<1 | 2 | 3 | 4 | 5>(1);
+  const [activeAppointments, setActiveAppointments] = useState<Appointment[]>(appointments);
+  const [activeBlockedDates, setActiveBlockedDates] = useState<string[]>(blockedDates);
+
+  useEffect(() => {
+    setActiveAppointments(appointments);
+  }, [appointments]);
+
+  useEffect(() => {
+    setActiveBlockedDates(blockedDates);
+  }, [blockedDates]);
+
+  const refreshAvailability = useCallback(async () => {
+    try {
+      const res = await fetchPublicAvailability();
+      if (res.success) {
+        if (Array.isArray(res.appointments)) setActiveAppointments(res.appointments);
+        if (Array.isArray(res.blockedDates)) setActiveBlockedDates(res.blockedDates);
+      }
+    } catch {}
+  }, []);
+  const [additionalServiceIds, setAdditionalServiceIds] = useState<string[]>([]);
+  const [showAdditionalServices, setShowAdditionalServices] = useState(false);
+  const [showAddAnotherPrompt, setShowAddAnotherPrompt] = useState(false);
+  const [customRequest, setCustomRequest] = useState<string>('');
+  const [appointmentLocation, setAppointmentLocation] = useState<'salon' | 'home'>('salon');
+  const [homeAddress, setHomeAddress] = useState<string>('');
+  const [clientName, setClientName] = useState<string>('');
+  const [clientPhone, setClientPhone] = useState<string>('');
+  const [isLookingUpClient, setIsLookingUpClient] = useState<boolean>(false);
+  const [clientLookupMessage, setClientLookupMessage] = useState<string>('');
+  const [isReturningClient, setIsReturningClient] = useState<boolean>(false);
+  const [isManualEdit, setIsManualEdit] = useState<boolean>(false);
+  const lastQueriedPhoneRef = useRef<string>('');
+  const [clientEmail, setClientEmail] = useState<string>('');
+  const [clientBirthDate, setClientBirthDate] = useState<string>('');
+
+  const formatBirthDateBR = (dateStr: string) => {
+    if (!dateStr) return '';
+    const match = dateStr.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    if (match) return `${match[3]}/${match[2]}/${match[1]}`;
+    return dateStr;
+  };
+
+  const performClientLookup = useCallback(async (phoneToQuery: string) => {
+    const digits = phoneToQuery.replace(/\D/g, '');
+    if (digits.length < 8) return;
+    if (lastQueriedPhoneRef.current === digits) return;
+    lastQueriedPhoneRef.current = digits;
+    setIsLookingUpClient(true);
+    setClientLookupMessage('');
+    try {
+      const result = await lookupPublicClientByPhone(phoneToQuery);
+      if (result.success && result.found && result.clientName) {
+        setClientName(result.clientName);
+        if (result.clientEmail && !clientEmail) setClientEmail(result.clientEmail);
+        if (result.clientBirthDate) setClientBirthDate(result.clientBirthDate);
+        setIsReturningClient(true);
+        setIsManualEdit(false);
+        if (result.isComplete || (result.clientName && result.clientBirthDate)) {
+          setClientLookupMessage('');
+        } else {
+          setClientLookupMessage('Cadastro localizado. Para concluir, informe sua data de nascimento.');
+        }
+      } else if (result.success) {
+        setIsReturningClient(false);
+        setIsManualEdit(true);
+        setClientLookupMessage('Novo cadastro: preencha seus dados para seu agendamento.');
+      } else {
+        setIsReturningClient(false);
+        setIsManualEdit(true);
+        setClientLookupMessage(result.error || 'Não foi possível consultar o cadastro. Preencha seus dados abaixo.');
+      }
+    } catch {
+      setIsReturningClient(false);
+      setIsManualEdit(true);
+    } finally {
+      setIsLookingUpClient(false);
+    }
+  }, [clientEmail]);
+
+  useEffect(() => {
+    const digits = clientPhone.replace(/\D/g, '');
+    if (digits.length === 10 || digits.length === 11) {
+      const timer = setTimeout(() => {
+        performClientLookup(clientPhone);
+      }, 400);
+      return () => clearTimeout(timer);
+    }
+  }, [clientPhone, performClientLookup]);
+
+  const handlePhoneChange = (val: string) => {
+    setClientPhone(val);
+    const digits = val.replace(/\D/g, '');
+    if (digits !== lastQueriedPhoneRef.current) {
+      lastQueriedPhoneRef.current = '';
+      setIsReturningClient(false);
+      setIsManualEdit(false);
+      setClientLookupMessage('');
+    }
+  };
+
+  const [clientInstagram, setClientInstagram] = useState<string>('');
+  const [nailCondition, setNailCondition] = useState<string>('Unhas naturais sem nenhum produto');
+  const [clientNotes, setClientNotes] = useState<string>('');
+  const [copiedPix, setCopiedPix] = useState<boolean>(false);
+  const [pixCopyError, setPixCopyError] = useState<boolean>(false);
+  const [receiptFileName, setReceiptFileName] = useState<string | null>(null);
+  const [bookingWhatsAppModal, setBookingWhatsAppModal] = useState<boolean>(false);
+  const [confirmedAppointment, setConfirmedAppointment] = useState<Appointment | null>(null);
+  const [isSubmittingBooking, setIsSubmittingBooking] = useState<boolean>(false);
+  const [submissionError, setSubmissionError] = useState<string | null>(null);
+  const [persistedAppointmentId, setPersistedAppointmentId] = useState<string | null>(null);
+
+
+  // Requirement 7: Opção de Pré-pagamento via Pix (Sinal de 40% ou 100%)
+  const [paymentMode, setPaymentMode] = useState<'sinal_40' | 'pre_pagamento_100'>('sinal_40');
+
+  // Requirement 6: Checagem de Inadimplência
+  const normalizedPhone = clientPhone.replace(/\D/g, '');
+  const matchedBlacklist = blacklist.find(b => {
+    if (!b.active) return false;
+    const bDigits = b.phone.replace(/\D/g, '');
+    return bDigits.length >= 8 && (normalizedPhone.includes(bDigits) || bDigits.includes(normalizedPhone));
+  });
+
+  const isInadimplente = Boolean(matchedBlacklist);
+  const effectivePaymentMode = isInadimplente ? 'pre_pagamento_100' : paymentMode;
+
+  const isAllDayBlock = (value: string) => ['dia inteiro', 'dia todo', 'all day'].includes(String(value || '').trim().toLowerCase());
+  const isDateBlocked = (dateStr: string): boolean => {
+    if (activeBlockedDates.some(bd => areDatesEqual(bd, dateStr))) return true;
+    if (daySchedules && daySchedules.length > 0) {
+      const date = new Date(`${dateStr}T12:00:00`);
+      const keys = ['dom', 'seg', 'ter', 'qua', 'qui', 'sex', 'sab'];
+      const dayConfig = daySchedules.find(day => day.dayKey === keys[date.getDay()]);
+      if (dayConfig && !dayConfig.isOpen) return true;
+    }
+    return activeAppointments.some(a => a.status === 'bloqueado' && areDatesEqual(a.date, dateStr) && isAllDayBlock(a.time));
+  };
+  const timeToMinutes = (value: string): number | null => {
+    const match = /^(\d{1,2}):(\d{2})$/.exec(String(value || '').trim());
+    if (!match) return null;
+    const hours = Number(match[1]), minutes = Number(match[2]);
+    return hours <= 23 && minutes <= 59 ? hours * 60 + minutes : null;
+  };
+  const eligibleAdditionalServices = services.filter(service => service.active !== false && service.id !== selectedService.id);
+  const additionalServices = eligibleAdditionalServices.filter(service => additionalServiceIds.includes(service.id));
+  const procedureDuration = calculateProcedureDuration(selectedService, additionalServices);
+  const combinedDurationMinutes = procedureDuration.totalMinutes || 0;
+  const isDurationValid = procedureDuration.isValid && combinedDurationMinutes > 0;
+
+  const isSlotUnavailable = (slotTime: string, dateKey: string = selectedDate): boolean => {
+    const start = timeToMinutes(slotTime);
+    if (start === null) return true;
+    if (!isDurationValid || !procedureDuration.totalMinutes) return true;
+
+    // Only reserve the actual time occupied by this procedure (plus any
+    // explicitly selected additional procedures).
+    const requestedDuration = procedureDuration.totalMinutes;
+    const end = start + requestedDuration;
+
+    if (daySchedules && daySchedules.length > 0) {
+      const date = new Date(`${dateKey}T12:00:00`);
+      const keys = ['dom', 'seg', 'ter', 'qua', 'qui', 'sex', 'sab'];
+      const dayConfig = daySchedules.find(day => day.dayKey === keys[date.getDay()]);
+      if (dayConfig) {
+        if (!dayConfig.isOpen) return true;
+        const opening = timeToMinutes(dayConfig.openTime);
+        const closing = timeToMinutes(dayConfig.closeTime);
+        if (opening === null || closing === null || start < opening || end > closing) return true;
+      }
+    }
+
+    return activeAppointments.some(a => {
+      if (!areDatesEqual(a.date, dateKey) || ['cancelado', 'teste_sistema'].includes(a.status)) return false;
+      const raw = String(a.time || '').trim();
+      if (a.status === 'bloqueado') {
+        if (isAllDayBlock(raw)) return true;
+        const interval = /^(\d{1,2}:\d{2})\s*(?:às|as|-)\s*(\d{1,2}:\d{2})$/i.exec(raw);
+        if (interval) {
+          const blockStart = timeToMinutes(interval[1]), blockEnd = timeToMinutes(interval[2]);
+          return blockStart !== null && blockEnd !== null && start < blockEnd && end > blockStart;
+        }
+      }
+      const occupiedStart = timeToMinutes(raw);
+      if (occupiedStart === null) return false;
+      const occupiedDuration = parseDurationMinutes(a.serviceDuration);
+      if (!occupiedDuration || occupiedDuration <= 0) return false;
+      const occupiedEnd = occupiedStart + occupiedDuration;
+      return start < occupiedEnd && end > occupiedStart;
+    });
+  };
+
+  const isPastDate = (date: Date) => toDateKey(date) < toDateKey(today);
+
+  const configuredActiveSlots = timeSlots.filter(slot => slot.active);
+  const generatedTimeSlots: TimeSlotConfig[] = (() => {
+    if (configuredActiveSlots.length > 0) return configuredActiveSlots;
+    if (!isDurationValid || !procedureDuration.totalMinutes) return [];
+    const date = new Date(`${selectedDate}T12:00:00`);
+    const keys = ['dom', 'seg', 'ter', 'qua', 'qui', 'sex', 'sab'];
+    const dayConfig = daySchedules?.find(day => day.dayKey === keys[date.getDay()]);
+    if (dayConfig && !dayConfig.isOpen) return [];
+    const opening = timeToMinutes(dayConfig?.openTime || '07:00') ?? 420;
+    const closing = timeToMinutes(dayConfig?.closeTime || '19:30') ?? 1170;
+    const duration = procedureDuration.totalMinutes;
+    const generated: TimeSlotConfig[] = [];
+    for (let minute = opening; minute + duration <= closing; minute += 15) {
+      const hh = String(Math.floor(minute / 60)).padStart(2, '0');
+      const mm = String(minute % 60).padStart(2, '0');
+      generated.push({ id: `generated-${selectedDate}-${hh}${mm}`, time: `${hh}:${mm}`, active: true, status: 'disponivel' });
+    }
+    return generated;
+  })();
+
+  const nextAvailableSuggestion = (() => {
+    const configuredSlots = generatedTimeSlots.filter(slot => slot.active && slot.status === 'disponivel').sort((a, b) => (timeToMinutes(a.time) ?? 0) - (timeToMinutes(b.time) ?? 0));
+    // First offer another time on the date the client already selected.
+    if (!isDateBlocked(selectedDate)) {
+      const sameDaySlot = configuredSlots.find(slot => !isSlotUnavailable(slot.time, selectedDate));
+      if (sameDaySlot) {
+        return { date: selectedDate, time: sameDaySlot.time, label: 'Nesta mesma data', sameDate: true };
+      }
+    }
+    // Only suggest a different date if the selected date has no free configured slots.
+    for (let offset = 1; offset <= 120; offset++) {
+      const candidate = new Date(`${selectedDate}T12:00:00`);
+      candidate.setDate(candidate.getDate() + offset);
+      const candidateKey = toDateKey(candidate);
+      if (isPastDate(candidate) || isDateBlocked(candidateKey)) continue;
+      const available = configuredSlots.find(slot => !isSlotUnavailable(slot.time, candidateKey));
+      if (available) return { date: candidateKey, time: available.time, label: candidate.toLocaleDateString('pt-BR', { weekday: 'long', day: '2-digit', month: 'long' }), sameDate: false };
+    }
+    return null;
+  })();
+  const dateLabel = (date: Date) => date.toLocaleDateString('pt-BR', { weekday: 'long', day: '2-digit', month: 'long', year: 'numeric' });
+  const monthLabel = visibleMonth.toLocaleDateString('pt-BR', { month: 'long', year: 'numeric' });
+  const monthOffset = (visibleMonth.getFullYear() - today.getFullYear()) * 12 + visibleMonth.getMonth() - today.getMonth();
+  const monthStartOffset = (visibleMonth.getDay() + 6) % 7;
+  const daysInVisibleMonth = new Date(visibleMonth.getFullYear(), visibleMonth.getMonth() + 1, 0).getDate();
+  const calendarCells: Array<number | null> = [
+    ...Array.from({ length: monthStartOffset }, () => null),
+    ...Array.from({ length: daysInVisibleMonth }, (_, index) => index + 1)
+  ];
+  const isDateUnavailable = (date: Date) => {
+    const key = toDateKey(date);
+    const sameDayAppointments = appointments.filter(a => areDatesEqual(a.date, key) && !['cancelado', 'teste_sistema'].includes(a.status));
+    return isDateBlocked(key) || (sameDayAppointments.length > 0 && sameDayAppointments.every(a => a.status === 'bloqueado' && isAllDayBlock(a.time)));
+  };
+
+  // Price calculations (40% deposit or 100% full prepayment of selected procedure's official price)
+  const servicePrice = selectedService.price + additionalServices.reduce((sum, service) => sum + service.price, 0);
+  const fullPrepayment = calculateFullPrepayment(servicePrice);
+  const standardDeposit = calculateDeposit40(servicePrice, paymentConfig.depositAmount);
+  const standardBalance = calculateRemainingBalance(servicePrice, standardDeposit);
+
+  const depositValue = effectivePaymentMode === 'pre_pagamento_100'
+    ? fullPrepayment
+    : standardDeposit;
+
+  const balanceRemaining = effectivePaymentMode === 'pre_pagamento_100'
+    ? 0
+    : calculateRemainingBalance(servicePrice, depositValue);
+
+
+  const pixKeyToCopy = (paymentConfig.pixKey || '+5512974062241').trim();
+
+  const handleCopyPix = async () => {
+    try {
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(pixKeyToCopy);
+        setCopiedPix(true);
+        setPixCopyError(false);
+        setTimeout(() => setCopiedPix(false), 3000);
+        return;
+      }
+    } catch {
+      // Fallback to execCommand below
+    }
+
+    try {
+      const textArea = document.createElement('textarea');
+      textArea.value = pixKeyToCopy;
+      textArea.style.position = 'fixed';
+      textArea.style.left = '-9999px';
+      textArea.style.top = '0';
+      document.body.appendChild(textArea);
+      textArea.focus();
+      textArea.select();
+      const successful = document.execCommand('copy');
+      document.body.removeChild(textArea);
+      if (successful) {
+        setCopiedPix(true);
+        setPixCopyError(false);
+        setTimeout(() => setCopiedPix(false), 3000);
+        return;
+      }
+    } catch {
+      // Error handled below
+    }
+
+    setPixCopyError(true);
+    setCopiedPix(false);
+    setTimeout(() => setPixCopyError(false), 4000);
+  };
+
+  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) {
+      setReceiptFileName(file.name);
+    }
+  };
+
+
+
+  const handleConfirmBooking = async () => {
+    if (bookingStep !== 5) {
+      setSubmissionError('Conclua as etapas do agendamento antes de avançar para a revisão.');
+      return;
+    }
+    // GitHub Pages is explicitly configured to use the official Apps Script endpoint.
+    // Success is shown only after the server confirms persistence.
+    if (isSubmittingBooking) return;
+
+    if (!selectedTime) {
+      setSubmissionError('Por favor, selecione um horário para o agendamento.');
+      setBookingStep(4);
+      return;
+    }
+
+    if (isDateBlocked(selectedDate)) {
+      setSubmissionError(
+        'A data selecionada está temporariamente bloqueada para novos agendamentos pela administração. Por favor, escolha outra data.'
+      );
+      setBookingStep(2);
+      return;
+    }
+
+    if (!clientName.trim()) {
+      alert('Por favor informe seu nome completo para o agendamento.');
+      return;
+    }
+    if (!clientPhone.trim()) {
+      alert('Por favor informe seu telefone WhatsApp para contato.');
+      return;
+    }
+    if (!clientBirthDate.trim()) {
+      setSubmissionError('Informe sua data de nascimento para continuar.');
+      return;
+    }
+    if (appointmentLocation === 'home' && homeAddress.trim().length < 8) {
+      setSubmissionError('Informe o endereço completo para atendimento em domicílio.');
+      return;
+    }
+
+    if (!isDurationValid || !procedureDuration.totalMinutes) {
+      setSubmissionError(procedureDuration.error || OFFICIAL_DURATION_MISSING_ERROR);
+      return;
+    }
+
+    setIsSubmittingBooking(true);
+    setSubmissionError(null);
+
+    // Pre-submission refresh: verify slot availability in real time before sending
+    try {
+      const freshAvail = await fetchPublicAvailability();
+      let currentAppts = activeAppointments;
+      let currentBlocked = activeBlockedDates;
+      if (freshAvail.success) {
+        if (Array.isArray(freshAvail.appointments)) {
+          currentAppts = freshAvail.appointments;
+          setActiveAppointments(freshAvail.appointments);
+        }
+        if (Array.isArray(freshAvail.blockedDates)) {
+          currentBlocked = freshAvail.blockedDates;
+          setActiveBlockedDates(freshAvail.blockedDates);
+        }
+      }
+
+      const slotIsBusy = currentAppts.some(a => {
+        if (!areDatesEqual(a.date, selectedDate) || ['cancelado', 'teste_sistema'].includes(a.status)) return false;
+        const raw = String(a.time || '').trim();
+        if (a.status === 'bloqueado') {
+          if (isAllDayBlock(raw)) return true;
+          const interval = /^(\d{1,2}:\d{2})\s*(?:às|as|-)\s*(\d{1,2}:\d{2})$/i.exec(raw);
+          if (interval) {
+            const blockStart = timeToMinutes(interval[1]), blockEnd = timeToMinutes(interval[2]);
+            const startMin = timeToMinutes(selectedTime);
+            return blockStart !== null && blockEnd !== null && startMin !== null && startMin < blockEnd && (startMin + combinedDurationMinutes) > blockStart;
+          }
+        }
+        const occupiedStart = timeToMinutes(raw);
+        if (occupiedStart === null) return false;
+        const occupiedDuration = parseDurationMinutes(a.serviceDuration);
+        if (!occupiedDuration || occupiedDuration <= 0) return false;
+        const occupiedEnd = occupiedStart + occupiedDuration;
+        const startMin = timeToMinutes(selectedTime);
+        return startMin !== null && startMin < occupiedEnd && (startMin + combinedDurationMinutes) > occupiedStart;
+      }) || currentBlocked.some(bd => areDatesEqual(bd, selectedDate));
+
+      if (slotIsBusy) {
+        setSelectedTime('');
+        setPersistedAppointmentId(null);
+        setBookingStep(4);
+        setSubmissionError('Este horário acabou de ser reservado. Por favor, escolha outro horário.');
+        setIsSubmittingBooking(false);
+        return;
+      }
+    } catch {}
+
+    const finalName = clientName.trim();
+    const finalPhone = clientPhone.trim();
+
+    // In public booking, recurrence is admin-only. Customers always book a single session.
+    const recurrenceConfig: RecurrenceConfig | undefined = undefined;
+
+    // Reutiliza o mesmo ID em tentativas de reenvio para evitar duplicatas
+    const appointmentId = persistedAppointmentId || `apt-${Date.now()}`;
+    if (!persistedAppointmentId) {
+      setPersistedAppointmentId(appointmentId);
+    }
+
+    const newAppointment: Appointment = {
+      id: appointmentId,
+      clientName: finalName,
+      clientPhone: finalPhone,
+      clientEmail: clientEmail.trim() || undefined,
+      clientBirthDate,
+      clientInstagram: clientInstagram || undefined,
+      nailCondition,
+      notes: clientNotes || undefined,
+      serviceId: selectedService.id,
+      additionalServiceIds,
+      customRequest: customRequest.trim() || undefined,
+      appointmentLocation,
+      homeAddress: appointmentLocation === 'home' ? homeAddress.trim() : undefined,
+      serviceTitle: [selectedService.title, ...additionalServices.map(service => service.title)].join(' + '),
+      servicePrice: `R$ ${formatBRL(servicePrice)}`,
+      serviceDuration: procedureDuration.formatted,
+      date: selectedDate,
+      time: selectedTime,
+      status: 'pendente_pix',
+      depositAmount: depositValue,
+      depositStatus: 'pendente',
+      paymentMode: effectivePaymentMode,
+      requiresFullPrepayment: isInadimplente,
+      isBlacklisted: isInadimplente,
+      recurrence: recurrenceConfig,
+      receiptFileName: receiptFileName || undefined,
+      clientInitials: finalName
+        .split(' ')
+        .map(n => n[0])
+        .slice(0, 2)
+        .join('')
+        .toUpperCase()
+    };
+
+    try {
+      const dispatchResult = await triggerNewPreBookingEmailNotification(newAppointment);
+
+      if (dispatchResult.success && dispatchResult.persisted === true) {
+        onBookingConfirmed(newAppointment);
+        setConfirmedAppointment(newAppointment);
+        setSubmissionError(null);
+        setBookingWhatsAppModal(true);
+      } else {
+        if (dispatchResult.conflict || dispatchResult.code === 'SLOT_UNAVAILABLE') {
+          setSelectedTime('');
+          setPersistedAppointmentId(null);
+          setBookingStep(4);
+          setSubmissionError(
+            dispatchResult.message || 'Este horário acabou de ser reservado. Por favor, escolha outro horário.'
+          );
+          void refreshAvailability();
+        } else {
+          setSubmissionError(
+            dispatchResult.message || 'Não foi possível confirmar e persistir a reserva na planilha oficial do Espaço. Por favor, tente novamente.'
+          );
+        }
+      }
+    } catch (err: any) {
+      setSubmissionError(
+        err?.message || 'Falha de comunicação ao conectar com o servidor do Espaço. Verifique sua conexão e tente novamente.'
+      );
+    } finally {
+      setIsSubmittingBooking(false);
+    }
+  };
+
+  return (
+    <section className="fixed inset-0 z-[80] overflow-y-auto bg-[#49382E]/60 px-3 py-4 sm:px-6 sm:py-8" id="wizard-agendamento" role="dialog" aria-modal="true" aria-label="Solicitação de agendamento">
+      <div className="mx-auto min-h-full w-full max-w-6xl rounded-2xl bg-[#FBF7F2] px-3 py-5 shadow-2xl sm:px-8 sm:py-8 lg:px-12">
+        <div className="mb-4 flex justify-end">
+          <button type="button" onClick={onClose} aria-label="Fechar agendamento" className="flex min-h-11 items-center gap-2 rounded-full border border-[#E8D9B5] bg-white px-4 py-2 text-sm font-semibold text-[#49382E] hover:bg-[#F7EFEA]"><span aria-hidden="true">×</span> Fechar</button>
+        </div>
+        {/* Header */}
+        <div className="text-center max-w-2xl mx-auto mb-10">
+          <span className="font-jakarta text-[11px] uppercase tracking-widest text-[#D4AF37] font-bold">
+            Reserva em 3 Etapas • Haute Protocol
+          </span>
+          <h2 className="font-syne text-2xl sm:text-3xl md:text-4xl text-[#49382E] font-bold mt-1">
+            Agendamento &amp; Escolha de Horário
+          </h2>
+          <p className="font-jakarta text-sm text-[#786C63] mt-2 leading-relaxed">
+            Selecione seu horário e envie sua solicitação para atendimento privativo no Pontal da Cruz, São Sebastião - SP.
+          </p>
+        </div>
+
+        {/* 3-Step Progress Ribbon - Compact & Responsive on Mobile */}
+        <div className="mb-8 sm:mb-10 p-3 sm:p-5 rounded-2xl bg-[#FFFFFF] border border-[#E8D9B5] shadow-xs">
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5 sm:gap-4">
+            <div className="flex items-center gap-2 sm:gap-3 p-1.5 rounded-xl bg-[#FDFBF9] sm:bg-transparent border sm:border-0 border-[#E8D9B5]/40">
+              <div className="w-7 h-7 sm:w-8 sm:h-8 rounded-full bg-[#D4AF37] text-[#3C2F00] flex items-center justify-center font-bold font-jakarta text-xs shadow-xs shrink-0">
+                1
+              </div>
+              <div className="flex flex-col min-w-0">
+                <span className="text-[9px] sm:text-[10px] font-jakarta text-[#D4AF37] uppercase tracking-wider font-bold">
+                  Procedimento
+                </span>
+                <span className="text-[11px] sm:text-sm font-jakarta text-[#49382E] truncate font-semibold">
+                  {selectedService.title}
+                </span>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-2 sm:gap-3 p-1.5 rounded-xl bg-[#FDFBF9] sm:bg-transparent border sm:border-0 border-[#E8D9B5]/40">
+              <div className="w-7 h-7 sm:w-8 sm:h-8 rounded-full bg-[#F7EFEA] text-[#49382E] flex items-center justify-center font-bold font-jakarta text-xs shrink-0 border border-[#E8D9B5]">
+                2
+              </div>
+              <div className="flex flex-col min-w-0">
+                <span className="text-[9px] sm:text-[10px] font-jakarta text-[#786C63] uppercase tracking-wider font-bold">
+                  Data &amp; Hora
+                </span>
+                <span className="text-[11px] sm:text-sm font-jakarta text-[#49382E] truncate font-semibold">
+                  {selectedDate} • {selectedTime}
+                </span>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-2 sm:gap-3 p-1.5 rounded-xl bg-[#FDFBF9] sm:bg-transparent border sm:border-0 border-[#E8D9B5]/40">
+              <div className="w-7 h-7 sm:w-8 sm:h-8 rounded-full bg-[#F7EFEA] text-[#786C63] flex items-center justify-center font-bold font-jakarta text-xs shrink-0 border border-[#E8D9B5]">
+                3
+              </div>
+              <div className="flex flex-col min-w-0">
+                <span className="text-[9px] sm:text-[10px] font-jakarta text-[#786C63] uppercase tracking-wider font-bold">
+                  {effectivePaymentMode === 'pre_pagamento_100' ? 'Pix (100%)' : 'Sinal (40%)'}
+                </span>
+                <span className="text-[11px] sm:text-sm font-jakarta text-[#D4AF37] truncate font-semibold">
+                  R$ {formatBRL(depositValue)}
+                </span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* Blacklist Delinquent Warning Banner */}
+        {isInadimplente && (
+          <div className="mb-8 p-4 sm:p-5 rounded-2xl bg-amber-50 border border-amber-300 shadow-md flex items-start gap-4">
+            <span className="material-symbols-outlined text-amber-700 text-[28px] shrink-0 mt-0.5">
+              gpp_maybe
+            </span>
+            <div className="flex-1 font-jakarta text-xs leading-relaxed">
+              <h4 className="font-syne text-sm sm:text-base font-bold text-amber-900">
+                Protocolo Especial de Agendamento Ativado
+              </h4>
+              <p className="text-amber-800 mt-1">
+                Identificamos uma restrição cadastral prévia para o número <strong>{clientPhone}</strong> ({matchedBlacklist?.reason || 'No-show / Pendência'}).
+              </p>
+              <p className="text-amber-950 mt-1.5 font-semibold">
+                Para confirmação deste horário na grade, é exigido o <strong>Pré-pagamento Integral (100% via Pix: R$ {formatBRL(servicePrice)})</strong>.
+              </p>
+            </div>
+          </div>
+        )}
+
+        {/* Main 2-Col Layout */}
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
+          {/* Left Flow (7 cols) */}
+          <div className="lg:col-span-7 space-y-6">
+            <div className="flex flex-wrap gap-2" aria-label="Etapas do agendamento">
+              {[
+                { n: 1, label: 'Contacto' }, { n: 2, label: 'Data' }, { n: 3, label: 'Procedimento' },
+                { n: 4, label: 'Horário' }, { n: 5, label: 'Revisão' }
+              ].map(step => (
+                <span key={step.n} className={`rounded-full px-3 py-1.5 text-xs font-semibold border ${bookingStep === step.n ? 'bg-[#D4AF37] text-[#3C2F00] border-[#D4AF37]' : bookingStep > step.n ? 'bg-[#F7EFEA] text-[#49382E] border-[#E8D9B5]' : 'bg-white text-[#786C63] border-[#E8D9B5]'}`}>
+                  {step.n}. {step.label}
+                </span>
+              ))}
+            </div>
+
+            {bookingStep === 1 && (
+              <div className="p-5 sm:p-7 rounded-2xl bg-white border border-[#E8D9B5] shadow-md space-y-4">
+                <h3 className="font-syne text-lg font-semibold text-[#49382E]">1. Informe seu WhatsApp</h3>
+                <p className="font-jakarta text-xs text-[#786C63]">
+                  Informe seu número com DDD. Se você já tem cadastro no Espaço Angélica, seus dados serão recuperados automaticamente da planilha oficial.
+                </p>
+
+                <div>
+                  <label className="block text-xs font-semibold text-[#49382E]">
+                    WhatsApp com DDD *
+                    <div className="relative mt-1">
+                      <input
+                        required
+                        type="tel"
+                        value={clientPhone}
+                        onChange={e => handlePhoneChange(e.target.value)}
+                        onBlur={() => {
+                          const digits = clientPhone.replace(/\D/g, '');
+                          if (digits.length >= 10 && !isReturningClient && !isLookingUpClient) {
+                            performClientLookup(clientPhone);
+                          }
+                        }}
+                        className="w-full px-3.5 py-3 rounded-xl bg-[#FDFBF9] border border-[#E8D9B5] text-sm pr-10"
+                        placeholder="(12) 99123-4567"
+                      />
+                      {isLookingUpClient && (
+                        <div className="absolute right-3 top-1/2 -translate-y-1/2">
+                          <span className="material-symbols-outlined text-[#D4AF37] animate-spin text-[20px]">
+                            progress_activity
+                          </span>
+                        </div>
+                      )}
+                    </div>
+                  </label>
+                </div>
+
+                {!isReturningClient && !isLookingUpClient && clientPhone.replace(/\D/g, '').length >= 8 && (
+                  <button
+                    type="button"
+                    onClick={() => performClientLookup(clientPhone)}
+                    className="w-full rounded-full border border-[#D4AF37] px-4 py-2 text-xs font-semibold text-[#49382E] hover:bg-[#FBF2D5] transition-colors"
+                  >
+                    Consultar meu cadastro
+                  </button>
+                )}
+
+                {clientLookupMessage && !isReturningClient && (
+                  <p className="text-xs text-[#786C63]" role="status">
+                    {clientLookupMessage}
+                  </p>
+                )}
+
+                {/* CASO A: Cadastro Completo Recuperado da Coluna Q */}
+                {isReturningClient && clientName.trim() && clientBirthDate.trim() && !isManualEdit ? (
+                  <div className="p-4 sm:p-5 rounded-2xl bg-[#FBF2D5]/70 border border-[#D4AF37] space-y-3">
+                    <div className="flex items-center gap-2 text-[#3C2F00]">
+                      <span className="material-symbols-outlined text-[#D4AF37] text-[22px]">verified</span>
+                      <h4 className="font-syne font-bold text-base">Olá, {clientName}!</h4>
+                    </div>
+                    <p className="font-jakarta text-xs text-[#49382E]">
+                      Seu cadastro foi localizado com sucesso. Não é necessário preencher seus dados novamente.
+                    </p>
+                    <div className="text-xs text-[#786C63] space-y-1.5 bg-white/90 p-3.5 rounded-xl border border-[#E8D9B5]">
+                      <p className="flex justify-between items-center">
+                        <span className="font-semibold text-[#49382E]">Nome:</span>
+                        <span>{clientName}</span>
+                      </p>
+                      <p className="flex justify-between items-center">
+                        <span className="font-semibold text-[#49382E]">WhatsApp:</span>
+                        <span>{clientPhone}</span>
+                      </p>
+                      {clientEmail && (
+                        <p className="flex justify-between items-center">
+                          <span className="font-semibold text-[#49382E]">E-mail:</span>
+                          <span>{clientEmail}</span>
+                        </p>
+                      )}
+                      <p className="flex justify-between items-center">
+                        <span className="font-semibold text-[#49382E]">Data de Nascimento:</span>
+                        <span className="font-bold text-[#49382E]">{formatBirthDateBR(clientBirthDate)}</span>
+                      </p>
+                    </div>
+
+                    <div className="pt-2 space-y-2">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setSubmissionError(null);
+                          setBookingStep(2);
+                        }}
+                        className="w-full rounded-full bg-[#D4AF37] px-5 py-3 font-bold text-[#3C2F00] shadow-sm hover:brightness-105 active:scale-98 transition-all flex items-center justify-center gap-2 cursor-pointer"
+                      >
+                        <span>Continuar para escolher a data</span>
+                        <span className="material-symbols-outlined text-[18px]">arrow_forward</span>
+                      </button>
+                      <div className="text-center">
+                        <button
+                          type="button"
+                          onClick={() => setIsManualEdit(true)}
+                          className="text-[11px] text-[#786C63] hover:text-[#49382E] underline underline-offset-2 transition-colors cursor-pointer"
+                        >
+                          Deseja alterar algum dado cadastrado? Clique aqui
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                ) : isReturningClient && clientName.trim() && !clientBirthDate.trim() && !isManualEdit ? (
+                  /* CASO B: Cadastro Parcial (Nome encontrado, mas Data de Nascimento ausente na Coluna Q) */
+                  <div className="space-y-4">
+                    <div className="p-3.5 rounded-xl bg-amber-50 border border-amber-300 text-xs text-amber-900 flex items-start gap-2">
+                      <span className="material-symbols-outlined text-[18px] shrink-0 text-amber-700">info</span>
+                      <div>
+                        <strong>Olá, {clientName}!</strong> Localizamos seu cadastro. Para concluir seu agendamento, por favor informe apenas sua data de nascimento.
+                      </div>
+                    </div>
+
+                    <label className="block text-xs font-semibold text-[#49382E]">
+                      Nome completo
+                      <input
+                        value={clientName}
+                        readOnly
+                        className="mt-1 w-full px-3.5 py-3 rounded-xl bg-[#F7EFEA] border border-[#E8D9B5] text-[#49382E] font-medium cursor-not-allowed opacity-90"
+                      />
+                    </label>
+
+                    <label className="block text-xs font-semibold text-[#49382E]">
+                      E-mail (opcional)
+                      <input
+                        type="email"
+                        value={clientEmail}
+                        onChange={e => setClientEmail(e.target.value)}
+                        className="mt-1 w-full px-3.5 py-3 rounded-xl bg-[#FDFBF9] border border-[#E8D9B5]"
+                        placeholder="voce@exemplo.com"
+                      />
+                    </label>
+
+                    <label className="block text-xs font-semibold text-[#49382E]">
+                      Data de nascimento *
+                      <input
+                        required
+                        type="date"
+                        max={toDateKey(today)}
+                        value={clientBirthDate}
+                        onChange={e => setClientBirthDate(e.target.value)}
+                        className="mt-1 w-full px-3.5 py-3 rounded-xl bg-[#FDFBF9] border border-[#E8D9B5]"
+                      />
+                    </label>
+
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (!clientBirthDate.trim()) {
+                          setSubmissionError('Por favor informe sua data de nascimento para continuar.');
+                          return;
+                        }
+                        setSubmissionError(null);
+                        setBookingStep(2);
+                      }}
+                      className="w-full rounded-full bg-[#D4AF37] px-5 py-3 font-bold text-[#3C2F00] shadow-sm hover:brightness-105 active:scale-98 transition-all cursor-pointer"
+                    >
+                      Continuar para escolher a data
+                    </button>
+                  </div>
+                ) : (
+                  /* CASO C: Novo Cadastro ou Modo de Edição */
+                  <div className="space-y-4">
+                    <label className="block text-xs font-semibold text-[#49382E]">
+                      Nome completo *
+                      <input
+                        required
+                        value={clientName}
+                        onChange={e => setClientName(e.target.value)}
+                        className="mt-1 w-full px-3.5 py-3 rounded-xl bg-[#FDFBF9] border border-[#E8D9B5]"
+                        placeholder="Seu nome completo"
+                      />
+                    </label>
+                    <label className="block text-xs font-semibold text-[#49382E]">
+                      E-mail (opcional)
+                      <input
+                        type="email"
+                        value={clientEmail}
+                        onChange={e => setClientEmail(e.target.value)}
+                        className="mt-1 w-full px-3.5 py-3 rounded-xl bg-[#FDFBF9] border border-[#E8D9B5]"
+                        placeholder="voce@exemplo.com"
+                      />
+                    </label>
+                    <label className="block text-xs font-semibold text-[#49382E]">
+                      Data de nascimento *
+                      <input
+                        required
+                        type="date"
+                        max={toDateKey(today)}
+                        value={clientBirthDate}
+                        onChange={e => setClientBirthDate(e.target.value)}
+                        className="mt-1 w-full px-3.5 py-3 rounded-xl bg-[#FDFBF9] border border-[#E8D9B5]"
+                      />
+                    </label>
+
+                    <div className="space-y-2 pt-1">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          if (!clientName.trim() || !clientPhone.trim() || !clientBirthDate.trim()) {
+                            setSubmissionError('Preencha o nome, o WhatsApp e a data de nascimento para continuar.');
+                            return;
+                          }
+                          setSubmissionError(null);
+                          setBookingStep(2);
+                        }}
+                        className="w-full rounded-full bg-[#D4AF37] px-5 py-3 font-bold text-[#3C2F00] shadow-sm hover:brightness-105 active:scale-98 transition-all cursor-pointer"
+                      >
+                        Continuar para escolher a data
+                      </button>
+
+                      {isManualEdit && isReturningClient && (
+                        <div className="text-center">
+                          <button
+                            type="button"
+                            onClick={() => setIsManualEdit(false)}
+                            className="text-[11px] text-[#786C63] hover:text-[#49382E] underline underline-offset-2 transition-colors cursor-pointer"
+                          >
+                            Voltar para o cadastro identificado
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {bookingStep === 3 && (
+              <div className="p-5 sm:p-7 rounded-2xl bg-white border border-[#E8D9B5] shadow-md space-y-4">
+                <h3 className="font-syne text-lg font-semibold text-[#49382E]">3. Escolhe o procedimento</h3>
+                <p className="text-xs text-[#786C63]">Os preços e as durações são os que estão no catálogo oficial.</p>
+                <div className="space-y-5">
+                  {(() => {
+                    const classifyService = (service: any) => {
+                      const normalize = (value: unknown) => String(value || '').normalize('NFD').replace(/[\\u0300-\\u036f]/g, '').toLowerCase();
+                      const category = normalize(service.category);
+                      const title = normalize(service.title);
+                      const combined = category + ' ' + title;
+                      if (/pedicure|\bpes\b|\bpe\b|podologia/.test(combined)) return 'Pedicure';
+                      if (/manicure|\bmaos\b|\bmao\b|esmalta|cuticula|cutilagem/.test(combined)) return 'Manicure';
+                      if (category.includes('depil')) return 'Depilação';
+                      if (category.includes('spa')) return 'Spa & Cuidados';
+                      if (/alongamento|blindagem|\bgel\b|fibra/.test(combined)) return 'Unha em gel';
+                      return service.category || 'Outros procedimentos';
+                    };
+                    // Nail Art is an optional add-on, never a primary procedure.
+                    const activeServices = services.filter(service =>
+                      service.active !== false && !/nail\s*art|nailart/i.test(String(service.title || ''))
+                    );
+                    const preferredOrder = ['Manicure', 'Pedicure', 'Unha em gel'];
+                    const groups = Array.from(new Set([...preferredOrder, ...activeServices.map(classifyService)]));
+                    return groups.map(group => {
+                      const groupServices = activeServices.filter(service => classifyService(service) === group);
+                      return <section key={group} className="space-y-2">
+                        <h4 className="font-syne font-semibold text-sm text-[#49382E]">{group}</h4>
+                        {groupServices.length === 0 ? <p className="px-3 py-2 text-xs text-[#786C63]">Serviços desta categoria serão exibidos aqui.</p> : groupServices.map(service => <button key={service.id} type="button" onClick={() => { onSelectService?.(service); setAdditionalServiceIds([]); setShowAdditionalServices(false); setShowAddAnotherPrompt(true); }}
+                          className={`w-full rounded-xl border p-4 text-left ${selectedService.id === service.id ? 'border-[#D4AF37] bg-[#FBF2D5]' : 'border-[#E8D9B5] bg-[#FDFBF9]'}`}>
+                          <span className="block font-semibold text-[#49382E]">{service.title}</span>
+                          <span className="block text-xs text-[#786C63]">{service.duration} · {service.priceFormatted}</span>
+                          {service.description && <span className="mt-1 block text-xs text-[#786C63]">{service.description}</span>}
+                        </button>)}
+                      </section>;
+                    });
+                  })()}
+                </div>
+                <div className="rounded-xl border border-[#E8D9B5] bg-[#FDFBF9] p-4 space-y-2">
+                  <div className="flex items-center justify-between gap-3">
+                    <div>
+                      <h4 className="font-syne font-semibold text-sm text-[#49382E]">Serviços adicionais</h4>
+                      <p className="text-[11px] text-[#786C63]">Adicione um ou mais serviços do catálogo ao mesmo agendamento.</p>
+                    </div>
+                    <button type="button" onClick={() => setShowAdditionalServices(true)} className="shrink-0 rounded-full border border-[#D4AF37] px-3 py-2 text-xs font-bold text-[#49382E]">
+                      {additionalServiceIds.length ? `Revisar (${additionalServiceIds.length})` : 'Ver opções'}
+                    </button>
+                  </div>
+                  {additionalServices.map(service => <div key={service.id} className="flex justify-between gap-2 text-xs"><span>{service.title}</span><span className="font-semibold">{service.priceFormatted}</span></div>)}
+                </div>
+                <div className="pt-2 space-y-2">
+                  {!isDurationValid && (
+                    <div className="p-3 rounded-xl bg-amber-50 border border-amber-300 text-amber-900 text-xs font-medium">
+                      ⚠️ {procedureDuration.error || OFFICIAL_DURATION_MISSING_ERROR}
+                    </div>
+                  )}
+                  <p className="text-[11px] text-[#786C63]">Depois de escolher um procedimento, você pode adicionar outros serviços ao mesmo atendimento ou seguir para escolher data e horário.</p>
+                  <button type="button" disabled={!isDurationValid} onClick={() => { if (!isDurationValid) return; setShowAddAnotherPrompt(false); setBookingStep(4); }} className="w-full rounded-full bg-[#D4AF37] disabled:opacity-50 disabled:cursor-not-allowed px-5 py-3 font-bold text-[#3C2F00]">Continuar para data e horário</button>
+                </div>
+              </div>
+            )}
+
+            {/* Panel 1: Data e Horário */}
+            <div className={`p-5 sm:p-7 rounded-2xl bg-[#FFFFFF] border border-[#E8D9B5] shadow-md space-y-5 ${bookingStep === 2 || bookingStep === 4 ? '' : 'hidden'}`}>
+              <div className="flex items-center justify-between pb-3 border-b border-[#E8D9B5]">
+                <div className="flex items-center gap-2">
+                  <span className="material-symbols-outlined text-[#D4AF37]">calendar_today</span>
+                  <h3 className="font-syne text-lg text-[#49382E] font-semibold">
+                    1. Escolha a Data
+                  </h3>
+                </div>
+                <span className="font-jakarta text-[11px] text-[#786C63]">
+                  Atendimento Terça a Sábado
+                </span>
+              </div>
+
+              {/* Dynamic calendar: today through four months ahead */}
+              <div className={`space-y-3 ${bookingStep === 2 ? '' : 'hidden'}`}>
+                <div className="flex items-center justify-between gap-3">
+                  <button type="button" aria-label="Mês anterior" disabled={monthOffset <= 0}
+                    onClick={() => setVisibleMonth(new Date(visibleMonth.getFullYear(), visibleMonth.getMonth() - 1, 1))}
+                    className="rounded-lg border border-[#E8D9B5] px-3 py-2 disabled:opacity-30 disabled:cursor-not-allowed">‹</button>
+                  <h4 className="font-syne font-semibold capitalize text-[#49382E]">{monthLabel}</h4>
+                  <button type="button" aria-label="Próximo mês" disabled={monthOffset >= 4}
+                    onClick={() => setVisibleMonth(new Date(visibleMonth.getFullYear(), visibleMonth.getMonth() + 1, 1))}
+                    className="rounded-lg border border-[#E8D9B5] px-3 py-2 disabled:opacity-30 disabled:cursor-not-allowed">›</button>
+                </div>
+                <div className="grid grid-cols-7 gap-1.5 text-center">
+                  {['Seg', 'Ter', 'Qua', 'Qui', 'Sex', 'Sáb', 'Dom'].map(day => (
+                    <span key={day} className="py-1 text-[10px] font-semibold text-[#786C63]">{day}</span>
+                  ))}
+                  {calendarCells.map((day, index) => {
+                    if (day === null) return <span key={`blank-${index}`} />;
+                    const date = new Date(visibleMonth.getFullYear(), visibleMonth.getMonth(), day);
+                    const key = toDateKey(date);
+                    const past = isPastDate(date);
+                    const unavailable = isDateUnavailable(date);
+                    const selected = selectedDate === key;
+                    const disabled = past || unavailable;
+                    return (
+                      <button key={key} type="button" disabled={disabled}
+                        aria-label={dateLabel(date)} aria-pressed={selected}
+                        onClick={() => { setSelectedDate(key); setSelectedTime(''); void refreshAvailability(); }}
+                        className={`min-h-10 rounded-lg border text-xs font-semibold transition-colors ${disabled ? 'bg-gray-100 text-gray-400 border-gray-200 cursor-not-allowed' : selected ? 'bg-[#D4AF37] text-[#3C2F00] border-[#D4AF37]' : 'bg-[#FDFBF9] text-[#49382E] border-[#E8D9B5] hover:border-[#D4AF37]'}`}>
+                        {day}
+                      </button>
+                    );
+                  })}
+                </div>
+                <p className="font-jakarta text-[11px] text-[#786C63]">Selecione uma data disponível. A agenda mostra o mês atual e até quatro meses à frente.</p>
+              </div>
+
+              {<div className="flex flex-wrap gap-2 pt-2"><button type="button" onClick={() => { setSelectedTime(''); setBookingStep(3); setShowAddAnotherPrompt(false); setShowAdditionalServices(false); }} className="rounded-full border border-[#D4AF37] px-4 py-2.5 text-xs font-bold text-[#49382E] hover:bg-[#FBF2D5]">← Voltar aos procedimentos</button><button type="button" onClick={() => { setSelectedTime(''); setBookingStep(2); }} className="rounded-full border border-[#E8D9B5] px-4 py-2.5 text-xs font-semibold text-[#786C63] hover:bg-[#FDFBF9]">Escolher outra data</button></div>
+              /* Time Slots Section */}
+              {bookingStep === 4 && <div className="pt-3 border-t border-[#E8D9B5] space-y-3">
+                <div className="flex items-center justify-between">
+                  <span className="font-jakarta text-xs text-[#786C63] font-medium">
+                    Horários Disponíveis para {selectedDate}:
+                  </span>
+                  <span className="font-jakarta text-[10px] text-[#D4AF37] font-semibold">
+                    {isDateBlocked(selectedDate)
+                      ? '0 horários abertos (Data Bloqueada)'
+                      : `${generatedTimeSlots.filter(s => s.status === 'disponivel' && s.active && !isSlotUnavailable(s.time)).length} horários abertos`}
+                  </span>
+                </div>
+
+                {!isDateBlocked(selectedDate) && generatedTimeSlots.filter(s => s.active && s.status === 'disponivel' && !isSlotUnavailable(s.time)).length === 0 ? (
+                  <div className="rounded-xl border border-[#E8D9B5] bg-[#FDFBF9] p-4 text-center space-y-2">
+                    <p className="font-jakarta text-sm font-semibold text-[#49382E]">Não há horários disponíveis nesta data.</p>
+                    <p className="font-jakarta text-xs text-[#786C63]">{nextAvailableSuggestion?.sameDate ? 'Este horário não está disponível. Podemos sugerir outro horário nesta mesma data:' : 'Não encontramos outro horário livre nesta data. Podemos sugerir a próxima data disponível:'}</p>
+                    {nextAvailableSuggestion ? (
+                      <div className="rounded-lg bg-white border border-[#E8D9B5] p-3 space-y-1">
+                        <p className="font-jakarta text-sm font-bold text-[#49382E]">{nextAvailableSuggestion.label}</p>
+                        <p className="font-jakarta text-sm text-[#786C63]">às <strong>{nextAvailableSuggestion.time}</strong></p>
+                        <button type="button" onClick={() => { setSelectedDate(nextAvailableSuggestion.date); setSelectedTime(nextAvailableSuggestion.time); setVisibleMonth(new Date(`${nextAvailableSuggestion.date}T12:00:00`)); setSubmissionError(null); }} className="mt-2 rounded-full bg-[#D4AF37] px-4 py-2 text-xs font-bold text-[#3C2F00]">Escolher {nextAvailableSuggestion.time}</button>
+                      </div>
+                    ) : <p className="font-jakarta text-xs text-[#786C63]">Não encontramos horários configurados nos próximos 120 dias. Entre em contato com o Espaço para combinar um horário.</p>}
+                    <button type="button" onClick={() => { setSelectedTime(''); setBookingStep(2); }} className="rounded-full border border-[#D4AF37] px-4 py-2 text-xs font-bold text-[#49382E]">Ver outras datas</button>
+                  </div>
+                ) : isDateBlocked(selectedDate) ? (
+                  <div className="p-4 rounded-xl bg-red-50 border border-red-200 text-red-800 text-center space-y-1">
+                    <div className="flex items-center justify-center gap-1.5 text-red-700 font-syne text-xs sm:text-sm font-bold">
+                      <span className="material-symbols-outlined text-[18px]">event_busy</span>
+                      <span>Esta data está temporariamente bloqueada para atendimentos</span>
+                    </div>
+                    <p className="font-jakarta text-[11px] text-red-600">
+                      Por favor, selecione outra data disponível no calendário acima para prosseguir com seu agendamento.
+                    </p>
+                  </div>
+                ) : (
+                  <div className="grid grid-cols-3 sm:grid-cols-4 gap-2 sm:gap-2.5">
+                    {generatedTimeSlots.map(slot => {
+                      const isBlocked = slot.status === 'bloqueado' || slot.status === 'autoclave' || slot.status === 'almoco' || isSlotUnavailable(slot.time);
+                      const isSelected = selectedTime === slot.time && !isBlocked;
+
+                      return (
+                        <button
+                          key={slot.id}
+                          type="button"
+                          disabled={isBlocked}
+                          onClick={() => setSelectedTime(slot.time)}
+                          className={`p-2 sm:p-2.5 rounded-xl border text-center transition-all min-h-[48px] flex flex-col items-center justify-center active:scale-95 ${
+                            isBlocked
+                              ? 'bg-[#F7EFEA] border-rose-200 text-[#786C63]/50 cursor-not-allowed'
+                              : isSelected
+                              ? 'bg-[#D4AF37] text-[#3C2F00] border-[#D4AF37] font-bold shadow-xs cursor-pointer'
+                              : 'bg-[#FDFBF9] border-[#E8D9B5] text-[#49382E] hover:border-[#D4AF37]/50 cursor-pointer'
+                          }`}
+                          title={slot.note || (isBlocked ? (isSlotUnavailable(slot.time) ? 'Horário Ocupado' : 'Horário Bloqueado') : 'Horário Disponível')}
+                        >
+                          <span className="font-syne text-sm font-bold block">{slot.time}</span>
+                          <span className="text-[10px] block font-jakarta truncate max-w-full px-1">
+                            {isBlocked ? (slot.note?.slice(0, 10) || (isSlotUnavailable(slot.time) ? 'Ocupado' : 'Bloqueado')) : 'Disponível'}
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>}
+              {selectedTime && isDurationValid && procedureDuration.totalMinutes && (
+                <div className="p-3.5 rounded-xl bg-[#F7EFEA] border border-[#E8D9B5] text-xs text-[#49382E] flex items-center justify-between shadow-xs">
+                  <div>
+                    <span className="block font-semibold">Horário selecionado:</span>
+                    <span className="text-[#D4AF37] font-bold text-sm">{selectedTime} às {calculateEndTime(selectedTime, procedureDuration.totalMinutes)}</span>
+                  </div>
+                  <span className="font-semibold text-xs px-2.5 py-1 rounded-full bg-[#FFFFFF] border border-[#E8D9B5]">{procedureDuration.formatted}</span>
+                </div>
+              )}
+              {!isDurationValid && (
+                <div className="p-3 rounded-xl bg-amber-50 border border-amber-300 text-amber-900 text-xs font-medium">
+                  ⚠️ {procedureDuration.error || OFFICIAL_DURATION_MISSING_ERROR}
+                </div>
+              )}
+              {bookingStep === 2 && <button type="button" onClick={() => { setSubmissionError(null); setSelectedTime(''); void refreshAvailability(); setBookingStep(4); }} className="w-full rounded-full bg-[#D4AF37] px-5 py-3 font-bold text-[#3C2F00]">Continuar para escolher o horário</button>}
+              {bookingStep === 4 && <button type="button" disabled={!isDurationValid} onClick={() => { if (!isDurationValid) { setSubmissionError(procedureDuration.error || OFFICIAL_DURATION_MISSING_ERROR); return; } if (!selectedTime || isSlotUnavailable(selectedTime) || isDateBlocked(selectedDate)) { setSubmissionError('Esse horário não está disponível. Por favor, escolha outro horário ou outra data.'); return; } setSubmissionError(null); setBookingStep(5); }} className="w-full rounded-full bg-[#D4AF37] disabled:opacity-50 disabled:cursor-not-allowed px-5 py-3 font-bold text-[#3C2F00]">Continuar para revisão</button>}
+            </div>
+
+
+            {/* Panel 3: Dados da Cliente */}
+            <div className="hidden">
+              <div className="flex items-center gap-2 pb-3 border-b border-[#E8D9B5]">
+                <span className="material-symbols-outlined text-[#D4AF37]">person</span>
+                <h3 className="font-syne text-lg text-[#49382E] font-semibold">
+                  3. Dados Pessoais &amp; Anamnese
+                </h3>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 font-jakarta text-xs">
+                <div>
+                  <label className="block text-[#49382E] font-medium mb-1 text-xs">Nome Completo *</label>
+                  <input
+                    type="text"
+                    required
+                    placeholder="Ex: Vanessa Lima"
+                    value={clientName}
+                    onChange={e => setClientName(e.target.value)}
+                    className="w-full px-3.5 py-2.5 rounded-xl bg-[#FDFBF9] text-[#49382E] border border-[#E8D9B5] outline-none focus:border-[#D4AF37] text-base sm:text-sm min-h-[44px]"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-[#49382E] font-medium mb-1 text-xs">WhatsApp com DDD *</label>
+                  <input
+                    type="tel"
+                    required
+                    placeholder="Ex: (12) 99123-4567"
+                    value={clientPhone}
+                    onChange={e => setClientPhone(e.target.value)}
+                    className="w-full px-3.5 py-2.5 rounded-xl bg-[#FDFBF9] text-[#49382E] border border-[#E8D9B5] outline-none focus:border-[#D4AF37] text-base sm:text-sm min-h-[44px]"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-[#49382E] font-medium mb-1 text-xs">E-mail (para confirmação via Gmail)</label>
+                  <input
+                    type="email"
+                    placeholder="seu.email@exemplo.com"
+                    value={clientEmail}
+                    onChange={e => setClientEmail(e.target.value)}
+                    className="w-full px-3.5 py-2.5 rounded-xl bg-[#FDFBF9] text-[#49382E] border border-[#E8D9B5] outline-none focus:border-[#D4AF37] text-base sm:text-sm min-h-[44px]"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-[#49382E] font-medium mb-1 text-xs">Instagram (opcional)</label>
+                  <input
+                    type="text"
+                    placeholder="@seu.perfil"
+                    value={clientInstagram}
+                    onChange={e => setClientInstagram(e.target.value)}
+                    className="w-full px-3.5 py-2.5 rounded-xl bg-[#FDFBF9] text-[#49382E] border border-[#E8D9B5] outline-none focus:border-[#D4AF37] text-base sm:text-sm min-h-[44px]"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-[#49382E] font-medium mb-1 text-xs">Condição Atual das Unhas</label>
+                  <select
+                    value={nailCondition}
+                    onChange={e => setNailCondition(e.target.value)}
+                    className="w-full px-3.5 py-2.5 rounded-xl bg-[#FDFBF9] text-[#49382E] border border-[#E8D9B5] outline-none focus:border-[#D4AF37] text-base sm:text-sm min-h-[44px]"
+                  >
+                    <option value="Unhas naturais sem nenhum produto">Unhas naturais sem produto</option>
+                    <option value="Alongamento de outro profissional (requer remoção)">Alongamento de outro espaço</option>
+                    <option value="Unhas roídas ou muito curtas">Unhas roídas ou muito curtas</option>
+                    <option value="Unhas com gel / blindagem atual">Unhas com gel / blindagem atual</option>
+                  </select>
+                </div>
+
+                <div className="sm:col-span-2">
+                  <label className="block text-[#49382E] font-medium mb-1 text-xs">Observações ou Preferências de Nail Art</label>
+                  <textarea
+                    rows={2}
+                    placeholder="Alguma alergia a esmaltes, formato preferido (Almond, Bailarina, Quadrada) ou referência de foto..."
+                    value={clientNotes}
+                    onChange={e => setClientNotes(e.target.value)}
+                    className="w-full px-3.5 py-2 rounded-xl bg-[#FDFBF9] text-[#49382E] border border-[#E8D9B5] outline-none focus:border-[#D4AF37] text-base sm:text-sm min-h-[70px]"
+                  />
+                </div>
+              </div>
+            </div>
+
+            {/* Panel 4: Escolha de Pagamento Pix (Sinal vs Pré-pagamento Total) */}
+            <div className={`p-5 sm:p-7 rounded-2xl bg-[#FFFFFF] border border-[#E8D9B5] shadow-md relative overflow-hidden ${bookingStep === 5 ? '' : 'hidden'}`}>
+              <div className="flex items-start justify-between gap-4 mb-4">
+                <div className="flex items-center gap-2">
+                  <span className="material-symbols-outlined text-[#D4AF37] text-[26px]">
+                    payments
+                  </span>
+                  <div>
+                    <h3 className="font-syne text-lg sm:text-xl text-[#49382E] font-semibold">
+                      Opções de Pré-pagamento via Pix
+                    </h3>
+                    <p className="font-jakarta text-xs text-[#786C63]">
+                      Escolha como deseja garantir sua vaga no Espaço privativo
+                    </p>
+                  </div>
+                </div>
+
+                <span className="px-3 py-1 rounded-full bg-[#FBF2D5] text-[#3C2F00] font-jakarta text-xs font-bold shrink-0 border border-[#E8D9B5]">
+                  Pix Banco Central
+                </span>
+              </div>
+
+              {/* Payment Mode Selector Tabs */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-5 font-jakarta text-xs">
+                {/* Option A: Sinal Padrão (40%) */}
+                <button
+                  type="button"
+                  disabled={isInadimplente}
+                  onClick={() => setPaymentMode('sinal_40')}
+                  className={`p-4 rounded-xl border text-left transition-all ${
+                    effectivePaymentMode === 'sinal_40'
+                      ? 'bg-[#FDFBF9] border-[#D4AF37] shadow-xs ring-1 ring-[#D4AF37]'
+                      : isInadimplente
+                      ? 'bg-[#F7EFEA] border-[#E8D9B5]/40 opacity-30 cursor-not-allowed'
+                      : 'bg-[#FFFFFF] border-[#E8D9B5] hover:border-[#D4AF37]/40 cursor-pointer'
+                  }`}
+                >
+                  <div className="flex items-center justify-between mb-1">
+                    <span className="font-syne text-sm font-bold text-[#49382E]">Sinal (40%)</span>
+                    <span className="font-bold text-[#D4AF37] text-base">R$ {formatBRL(standardDeposit)}</span>
+                  </div>
+                  <p className="text-[#786C63] leading-relaxed">
+                    Garante a vaga e é descontado do valor total no dia do atendimento. Saldo restante: <strong>R$ {formatBRL(standardBalance)}</strong>.
+                  </p>
+                  {isInadimplente && (
+                    <span className="text-[10px] text-red-500 font-bold block mt-1">
+                      Indisponível para números com restrição
+                    </span>
+                  )}
+                </button>
+
+                {/* Option B: Pré-pagamento Total 100% Pix */}
+                <button
+                  type="button"
+                  onClick={() => setPaymentMode('pre_pagamento_100')}
+                  className={`p-4 rounded-xl border text-left transition-all cursor-pointer ${
+                    effectivePaymentMode === 'pre_pagamento_100'
+                      ? 'bg-[#FDFBF9] border-[#D4AF37] shadow-xs ring-1 ring-[#D4AF37]'
+                      : 'bg-[#FFFFFF] border-[#E8D9B5] hover:border-[#D4AF37]/40'
+                  }`}
+                >
+                  <div className="flex items-center justify-between mb-1">
+                    <span className="font-syne text-sm font-bold text-[#49382E]">Pré-pagamento Total (100%)</span>
+                    <span className="font-bold text-[#D4AF37] text-base">
+                      R$ {formatBRL(fullPrepayment)}
+                    </span>
+                  </div>
+                  <p className="text-[#786C63] leading-relaxed">
+                    Procedimento quitado com prioridade VIP. Chegue ao Espaço sem preocupações financeiras adicionais ao final.
+                  </p>
+                </button>
+              </div>
+
+              {/* Pix Details Box */}
+              <div className="p-4 rounded-xl bg-[#F7EFEA] border border-[#E8D9B5] space-y-4">
+                <div className="flex flex-col items-stretch gap-4 w-full">
+                  <div className="flex items-start gap-3 min-w-0 w-full">
+                    <div className="w-12 h-12 sm:w-14 sm:h-14 rounded-xl bg-[#FFFFFF] flex items-center justify-center text-[#D4AF37] border border-[#E8D9B5] shrink-0 shadow-xs">
+                      <span className="material-symbols-outlined text-[26px] sm:text-[30px]">qr_code_2</span>
+                    </div>
+
+                    <div className="min-w-0 flex-1 w-full">
+                      <span className="block font-jakarta text-[11px] text-[#786C63]">
+                        Chave Pix oficial (telefone celular)
+                      </span>
+                      <span className="block w-full font-mono text-[#49382E] font-bold text-base sm:text-lg select-all tracking-normal break-words [overflow-wrap:anywhere]">
+                        {paymentConfig.pixKey || '+55 12 97406-2241'}
+                      </span>
+                      <span className="block font-jakarta text-[11px] text-[#786C63]">
+                        (12) 97406-2241
+                      </span>
+                      <span className="block font-jakarta text-xs text-[#D4AF37] font-semibold whitespace-normal break-words">
+                        Favorecido: {paymentConfig.pixBeneficiary || 'Titular informado no Pix'}
+                      </span>
+                      <span className="block font-jakarta text-[11px] text-[#786C63] mt-0.5">
+                        Valor a transferir: <strong className="text-[#49382E] text-sm">R$ {formatBRL(depositValue)}</strong>
+                      </span>
+                    </div>
+                  </div>
+
+                  <div className="flex flex-col sm:flex-row items-center gap-2 w-full">
+                    <button
+                      type="button"
+                      onClick={handleCopyPix}
+                      className={`w-full sm:w-auto px-5 py-2.5 sm:py-3 rounded-full font-jakarta text-xs sm:text-[13px] font-bold transition-all flex items-center justify-center gap-2 cursor-pointer shadow-xs min-h-[46px] active:scale-95 ${
+                        copiedPix
+                          ? 'bg-emerald-600 text-white shadow-md ring-2 ring-emerald-400'
+                          : pixCopyError
+                          ? 'bg-rose-600 text-white shadow-md ring-2 ring-rose-400'
+                          : 'bg-[#D4AF37] hover:bg-[#E5C158] text-[#3C2F00]'
+                      }`}
+                    >
+                      <span className="material-symbols-outlined text-[18px]">
+                        {copiedPix ? 'check_circle' : pixCopyError ? 'error' : 'content_copy'}
+                      </span>
+                      <span>
+                        {copiedPix
+                          ? 'Chave Copiada com Sucesso!'
+                          : pixCopyError
+                          ? 'Erro ao copiar - Selecione acima'
+                          : 'Copiar Chave Pix'}
+                      </span>
+                    </button>
+
+                    <label className={`w-full sm:w-auto px-4 py-2.5 sm:py-3 rounded-full border text-xs font-semibold flex items-center justify-center gap-1.5 transition-colors cursor-pointer min-h-[46px] active:scale-95 ${
+                      receiptFileName
+                        ? 'bg-emerald-50 text-emerald-800 border-emerald-300'
+                        : 'bg-[#FFFFFF] text-[#49382E] border-[#E8D9B5] hover:bg-[#FDFBF9]'
+                    }`}>
+                      <span className="material-symbols-outlined text-[18px] text-[#D4AF37]">
+                        {receiptFileName ? 'check_circle' : 'attach_file'}
+                      </span>
+                      <span className="truncate max-w-[150px]">
+                        {receiptFileName ? receiptFileName : 'Selecionar Comprovante'}
+                      </span>
+                      <input
+                        type="file"
+                        accept="image/*,application/pdf"
+                        onChange={handleFileUpload}
+                        className="hidden"
+                      />
+                    </label>
+                  </div>
+                </div>
+
+                <div className="p-2.5 rounded-lg bg-[#FFFFFF] border border-[#E8D9B5] text-[11px] text-[#786C63] flex items-center gap-2">
+                  <span className="material-symbols-outlined text-[#D4AF37] text-[16px] shrink-0">info</span>
+                  <span>
+                    O pagamento é conferido manualmente pela profissional no extrato bancário. Ao abrir o WhatsApp, você também pode compartilhar a imagem do comprovante.
+                  </span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* Right Summary Sticky Card (5 cols) */}
+          <div className="lg:col-span-5 space-y-4 lg:sticky lg:top-28">
+            {bookingStep >= 3 ? (
+            <div className="p-6 rounded-2xl bg-[#FFFFFF] border border-[#E8D9B5] shadow-xl relative overflow-hidden">
+              <div className="flex items-center justify-between pb-3 border-b border-[#E8D9B5]">
+                <span className="font-jakarta text-[11px] uppercase tracking-widest text-[#D4AF37] font-bold">
+                  Resumo da Solicitação
+                </span>
+                <span className="font-jakarta text-[11px] text-[#786C63]">
+                  Pontal da Cruz, SP
+                </span>
+              </div>
+
+              {/* Selected Service Card */}
+              <div className="py-4 border-b border-[#E8D9B5] space-y-2.5">
+                <div className="flex items-center gap-3.5">
+                  <img
+                    src={selectedService.imageUrl}
+                    alt={selectedService.title}
+                    className="w-16 h-16 rounded-xl object-cover border border-[#E8D9B5] shadow-xs shrink-0"
+                  />
+                  <div className="flex flex-col min-w-0 flex-1">
+                    <span className="font-syne text-base font-bold text-[#49382E] truncate">
+                      {selectedService.title}
+                    </span>
+                    <span className="font-jakarta text-xs text-[#786C63]">
+                      Duração estimada: {selectedService.duration}
+                    </span>
+                    <span className="font-jakarta text-xs text-[#49382E] font-bold mt-0.5">
+                      {selectedService.priceFormatted}
+                    </span>
+                  </div>
+                </div>
+
+                <p className="pt-1 text-[10px] text-[#786C63]">Serviço principal selecionado — exibido apenas para conferência.</p>
+              </div>
+
+              <div className="py-4 border-b border-[#E8D9B5] space-y-3">
+                <div className="flex items-center justify-between gap-3">
+                  <h4 className="font-syne font-semibold text-sm text-[#49382E]">Serviços adicionais</h4>
+
+                </div>
+                <p className="text-[10px] text-[#786C63]">Escolha entre os serviços ativos cadastrados no sistema. Os preços são os valores oficiais carregados do cadastro.</p>
+                {additionalServices.map(service => <div key={service.id} className="flex justify-between gap-2 text-xs"><span>{service.title}</span><span className="font-semibold">{service.priceFormatted}</span></div>)}
+                {showAddAnotherPrompt && bookingStep === 3 && createPortal(<div className="fixed inset-0 z-[125] bg-[#49382E]/60 backdrop-blur-sm flex items-center justify-center p-4"><div role="dialog" aria-modal="true" aria-label="Adicionar outro serviço" className="w-full max-w-sm rounded-2xl bg-white border border-[#E8D9B5] p-6 shadow-2xl text-center space-y-3"><h4 className="font-syne text-lg font-semibold text-[#49382E]">Deseja adicionar outro serviço?</h4><p className="text-sm text-[#786C63]">Você pode combinar mais de um procedimento no mesmo agendamento.</p><button type="button" onClick={() => { setShowAddAnotherPrompt(false); setShowAdditionalServices(true); }} className="w-full rounded-full bg-[#D4AF37] px-4 py-3 font-bold text-[#3C2F00]">Sim, adicionar outro serviço</button><button type="button" onClick={() => { setShowAddAnotherPrompt(false); setBookingStep(4); }} className="w-full rounded-full border border-[#D4AF37] px-4 py-3 font-bold text-[#49382E]">Não, continuar</button></div></div>, document.body)}
+                {showAdditionalServices && bookingStep === 3 && createPortal(<div className="fixed inset-0 z-[120] bg-[#49382E]/60 backdrop-blur-sm flex items-center justify-center p-4">
+                  <div role="dialog" aria-modal="true" aria-label="Serviços adicionais" className="w-full max-w-md max-h-[80vh] overflow-y-auto rounded-2xl bg-white border border-[#E8D9B5] p-5 shadow-2xl">
+                    <div className="flex items-center justify-between gap-3 mb-3"><h4 className="font-bold text-sm text-[#49382E]">Adicionar serviços ao agendamento</h4><button type="button" onClick={() => setShowAdditionalServices(false)} className="rounded-full border border-[#E8D9B5] px-3 py-2">Fechar</button></div>
+                    <p className="text-xs text-[#786C63] mb-3">Adicionais opcionais: escolha Nail Art, francesinha em gel ou outro serviço, se desejar. Os valores oficiais vêm do catálogo; Nail Art e francesinha são cobradas à parte.</p>
+                    {eligibleAdditionalServices.map(service => <label key={service.id} className="flex items-start gap-2 py-3 border-b border-[#E8D9B5] text-xs"><input type="checkbox" checked={additionalServiceIds.includes(service.id)} onChange={event => setAdditionalServiceIds(current => event.target.checked ? Array.from(new Set([...current, service.id])) : current.filter(id => id !== service.id))} className="accent-[#D4AF37]" /><span className="flex-1"><span className="block font-semibold">{service.title}</span><span className="block text-[#786C63]">{service.description}</span><span className="block text-[10px] text-[#9A7A28]">Opcional · adicional ao procedimento principal</span></span><span className="font-semibold whitespace-nowrap">{/nail\s*art|francesinha/i.test(service.title) ? `A partir de ${service.priceFormatted}` : service.priceFormatted}</span></label>)}
+                    {eligibleAdditionalServices.length === 0 && <p className="text-xs text-[#786C63] py-3">Não há outros serviços ativos cadastrados.</p>}
+                    <button type="button" onClick={() => setShowAdditionalServices(false)} className="mt-4 w-full rounded-full bg-[#D4AF37] px-4 py-3 font-bold text-[#49382E]">Confirmar seleção</button>
+                  </div>
+                </div>, document.body)}
+                <label className="block text-xs font-semibold text-[#49382E]">Pedido personalizado (opcional)
+                  <textarea value={customRequest} onChange={event => setCustomRequest(event.target.value)}
+                    placeholder="Ex.: decoração especial de unhas (preço sujeito à confirmação)"
+                    rows={2} className="mt-1 w-full rounded-lg border border-[#E8D9B5] bg-[#FDFBF9] p-2 text-xs" />
+                </label>
+                <p className="text-[10px] text-[#786C63]">Pedidos personalizados sem preço cadastrado precisam de confirmação e não alteram o total automaticamente.</p>
+                <h4 className="font-syne font-semibold text-sm text-[#49382E] pt-1">Local do atendimento</h4>
+                <div className="flex flex-wrap gap-4 text-xs">
+                  <label className="flex items-center gap-2"><input type="radio" name="appointmentLocation" checked={appointmentLocation === 'salon'} onChange={() => setAppointmentLocation('salon')} /> No Espaço</label>
+                  <label className="flex items-center gap-2"><input type="radio" name="appointmentLocation" checked={appointmentLocation === 'home'} onChange={() => setAppointmentLocation('home')} /> Em domicílio</label>
+                </div>
+                {appointmentLocation === 'home' && (
+                  <label className="block text-xs font-semibold text-[#49382E]">Endereço completo *
+                    <textarea required value={homeAddress} onChange={event => setHomeAddress(event.target.value)}
+                      placeholder="Rua, número, bairro, cidade e referência" rows={2}
+                      className="mt-1 w-full rounded-lg border border-[#E8D9B5] bg-[#FDFBF9] p-2 text-xs" />
+                  </label>
+                )}
+              </div>
+
+              {/* Booking Specifications */}
+              <div className="py-4 space-y-2.5 font-jakarta text-xs">
+                <div className="flex justify-between text-[#786C63]">
+                  <span>Data Selecionada:</span>
+                  <span className="text-[#49382E] font-medium">{selectedDate}</span>
+                </div>
+
+                <div className="flex justify-between text-[#786C63]">
+                  <span>Horário Selecionado:</span>
+                  <span className="text-[#49382E] font-medium">{selectedTime}</span>
+                </div>
+
+                {/* Price Breakdown */}
+                <div className="pt-2 border-t border-[#E8D9B5] space-y-2 text-xs">
+                  <div className="flex justify-between text-[#786C63]">
+                    <span>Total do procedimento</span>
+                    <span className="text-[#49382E] font-semibold">R$ {formatBRL(servicePrice)}</span>
+                  </div>
+
+                  {effectivePaymentMode === 'pre_pagamento_100' ? (
+                    <>
+                      <div className="flex justify-between text-[#786C63]">
+                        <span>Sinal (40%)</span>
+                        <span className="text-[#49382E] font-medium">R$ {formatBRL(standardDeposit)}</span>
+                      </div>
+                      <div className="flex justify-between text-[#D4AF37] font-bold">
+                        <span>Valor via Pix Antecipado (100%)</span>
+                        <span>R$ {formatBRL(depositValue)}</span>
+                      </div>
+                      <div className="pt-2 flex justify-between font-syne text-sm sm:text-base text-[#49382E] font-bold border-t border-[#E8D9B5]">
+                        <span>Saldo restante a pagar no atendimento</span>
+                        <span className="text-emerald-700">R$ 0,00</span>
+                      </div>
+                    </>
+                  ) : (
+                    <>
+                      <div className="flex justify-between text-[#D4AF37]">
+                        <span className="font-semibold">Sinal (40%)</span>
+                        <span className="font-bold">R$ {formatBRL(depositValue)}</span>
+                      </div>
+                      <div className="pt-2 flex justify-between font-syne text-sm sm:text-base text-[#49382E] font-bold border-t border-[#E8D9B5]">
+                        <span>Saldo restante a pagar no atendimento</span>
+                        <span className="text-[#D4AF37]">R$ {formatBRL(balanceRemaining)}</span>
+                      </div>
+                    </>
+                  )}
+                </div>
+
+                {/* Appointment Policy Displayed Before Submission */}
+                <div className="mt-4 p-3.5 rounded-xl bg-[#FDFBF9] border border-[#E8D9B5] space-y-2 text-[11px] text-[#786C63] leading-relaxed">
+                  <div className="flex items-center gap-1.5 text-[#49382E] font-syne font-bold text-xs uppercase tracking-wider">
+                    <span className="material-symbols-outlined text-[#D4AF37] text-[16px]">policy</span>
+                    <span>POLÍTICA DE AGENDAMENTO</span>
+                  </div>
+                  <ul className="space-y-1.5 list-disc pl-4">
+                    <li>
+                      Para confirmar o horário, é necessário pagar um sinal de 40% do valor do procedimento.
+                    </li>
+                    <li>
+                      O sinal garante a vaga e é descontado do valor total no dia do atendimento.
+                    </li>
+                    <li>
+                      Em caso de desistência ou não comparecimento, o sinal não é reembolsado, pois cobre o bloqueio da vaga e os preparativos.
+                    </li>
+                    <li>
+                      Mudanças de data exigem pelo menos 24 horas de antecedência, mantendo o sinal pago.
+                    </li>
+                  </ul>
+                </div>
+              </div>
+
+              {/* CTA Final Booking */}
+              <div className="mt-4 space-y-2">
+                {submissionError && (
+                  <div className="p-4 rounded-2xl bg-rose-50 border border-rose-300 text-rose-900 text-xs text-left space-y-2.5 shadow-sm">
+                    <div className="flex items-center gap-1.5 font-bold text-rose-800">
+                      <span className="material-symbols-outlined text-[18px]">error</span>
+                      <span>Não foi possível registrar seu agendamento</span>
+                    </div>
+                    <p className="leading-relaxed text-[11px] text-rose-800">
+                      {submissionError}
+                    </p>
+                    <button
+                      type="button"
+                      disabled={isSubmittingBooking}
+                      onClick={handleConfirmBooking}
+                      className="w-full py-2.5 px-4 rounded-xl bg-rose-600 hover:bg-rose-700 text-white font-jakarta text-xs font-bold transition-all flex items-center justify-center gap-1.5 cursor-pointer shadow-xs disabled:opacity-50"
+                    >
+                      <span className="material-symbols-outlined text-[16px]">refresh</span>
+                      <span>{isSubmittingBooking ? 'Tentando novamente...' : 'Tentar Novamente'}</span>
+                    </button>
+                  </div>
+                )}
+
+                <button
+                  type="button"
+                  disabled={isSubmittingBooking}
+                  onClick={handleConfirmBooking}
+                  className={`w-full py-3.5 sm:py-4 rounded-full bg-[#D4AF37] hover:bg-[#E5C158] text-[#3C2F00] font-jakarta text-sm sm:text-base font-bold transition-all duration-300 shadow-[0_12px_32px_-4px_rgba(212,175,55,0.35)] flex items-center justify-center gap-2 min-h-[50px] ${
+                    isSubmittingBooking ? 'opacity-70 cursor-not-allowed' : 'cursor-pointer active:scale-98'
+                  }`}
+                >
+                  <span className="material-symbols-outlined text-[20px]">check_circle</span>
+                  <span>{isSubmittingBooking ? 'Registrando agendamento...' : 'Confirmar & Salvar Agendamento'}</span>
+                </button>
+                <p className="text-center font-jakarta text-[11px] text-[#786C63] leading-tight">
+                  O agendamento será salvo automaticamente no sistema e encaminhado para validação do Pix pela Angélica.
+                </p>
+              </div>
+            </div>
+            ) : null}
+
+            {/* Endereço do Espaço */}
+            <div className="p-4 rounded-2xl bg-[#FFFFFF] border border-[#E8D9B5] flex items-start gap-3 shadow-xs">
+              <span className="material-symbols-outlined text-[#D4AF37] text-[22px] shrink-0 mt-0.5">
+                location_on
+              </span>
+              <div className="font-jakarta text-[11px] text-[#786C63] leading-snug">
+                <span className="text-[#49382E] font-bold block mb-0.5">Espaço Angelica do Carmo</span>
+                <span>{studioAddress.fullAddress}</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Booking Success Modal */}
+      {bookingWhatsAppModal && (
+        <div className="fixed inset-0 z-50 bg-[#49382E]/60 backdrop-blur-md flex items-center justify-center p-4">
+          <div className="bg-[#FFFFFF] p-6 sm:p-8 rounded-3xl max-w-md w-full border border-[#E8D9B5] shadow-2xl text-center space-y-4">
+            <div className="w-16 h-16 rounded-full bg-emerald-100 text-emerald-700 mx-auto flex items-center justify-center border border-emerald-300">
+              <span className="material-symbols-outlined text-[36px]">check_circle</span>
+            </div>
+
+            <div>
+              <h3 className="font-syne text-2xl text-[#49382E] font-bold">Pré-Agendamento Registrado!</h3>
+              <p className="font-jakarta text-xs sm:text-sm text-[#786C63] mt-1.5 leading-relaxed">
+                Sua solicitação para <strong>{selectedDate} às {selectedTime}</strong> ({selectedService.title}) foi salva no sistema.
+              </p>
+            </div>
+
+            <div className="py-2.5 px-3.5 rounded-xl bg-[#F7EFEA] border border-[#E8D9B5] text-xs text-[#49382E] text-left space-y-1">
+              <div className="font-bold flex items-center justify-between">
+                <span>Status: Pendente de Conferência</span>
+                <span className="text-[#D4AF37]">
+                  {(confirmedAppointment?.paymentMode || effectivePaymentMode) === 'pre_pagamento_100'
+                    ? 'Pré-pagamento (100%)'
+                    : 'Sinal (40%)'}
+                  : R$ {formatBRL(depositValue)}
+                </span>
+              </div>
+              <div className="text-[11px] text-[#786C63] flex items-center justify-between">
+                <span>Total: R$ {formatBRL(servicePrice)}</span>
+                <span>Saldo no dia: R$ {formatBRL(balanceRemaining)}</span>
+              </div>
+              <div className="text-[11px] text-[#786C63] pt-0.5">
+                Chave PIX: <strong>12974062241</strong> • Titular: <strong>Angelica do Carmo Costa Santos</strong>
+              </div>
+            </div>
+
+            <p className="font-jakarta text-[11px] text-[#786C63] text-left leading-relaxed">
+              Obrigada, <strong>{clientName}</strong>! Seu horário está reservado mediante{' '}
+              {(confirmedAppointment?.paymentMode || effectivePaymentMode) === 'pre_pagamento_100'
+                ? 'o pré-pagamento integral'
+                : 'o sinal de 40%'}
+              . Envie seu comprovante para que possamos confirmar seu atendimento.
+            </p>
+
+            {/* Optional WhatsApp Button or Safe Test Indicator */}
+            {Boolean(
+              confirmedAppointment?.status === 'teste_sistema' ||
+              (confirmedAppointment?.id && confirmedAppointment.id.startsWith('test-')) ||
+              (confirmedAppointment?.clientName && confirmedAppointment.clientName.toLowerCase().includes('teste_sistema')) ||
+              (clientName && clientName.toLowerCase().includes('teste_sistema'))
+            ) ? (
+              <div className="p-3.5 rounded-xl bg-amber-50 border border-amber-300 text-amber-900 text-xs font-semibold space-y-1">
+                <div className="flex items-center justify-center gap-1.5 text-amber-800">
+                  <span className="material-symbols-outlined text-[18px]">security</span>
+                  <span>Modo Teste de Sistema Ativo</span>
+                </div>
+                <p className="text-[11px] text-amber-700 font-normal">
+                  Disparo de WhatsApp para cliente e notificações para a titular estão desativados neste teste seguro.
+                </p>
+              </div>
+            ) : (
+              <div className="pt-2 space-y-2">
+                <a
+                  href={buildOfficialWhatsAppUrl({
+                    clientName: confirmedAppointment?.clientName || clientName,
+                    serviceTitle: confirmedAppointment?.serviceTitle || selectedService.title,
+                    servicePrice: confirmedAppointment?.servicePrice || selectedService.priceFormatted,
+                    date: confirmedAppointment?.date || selectedDate,
+                    time: confirmedAppointment?.time || selectedTime,
+                    depositAmount: confirmedAppointment?.depositAmount || depositValue,
+                    remainingBalance: balanceRemaining,
+                    paymentMode: confirmedAppointment?.paymentMode || effectivePaymentMode,
+                    pixKey: paymentConfig.pixKey,
+                    pixBeneficiary: paymentConfig.pixBeneficiary,
+                    depositPercent: paymentConfig.depositAmount
+                  })}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="w-full py-3 px-4 rounded-full bg-[#25D366] hover:bg-[#20bd5a] text-white font-jakarta text-xs sm:text-sm font-bold transition-all shadow-md flex items-center justify-center gap-2 cursor-pointer active:scale-95 min-h-[46px]"
+                >
+                  <span className="material-symbols-outlined text-[20px]">chat</span>
+                  <span>Enviar mensagem pelo WhatsApp</span>
+                </a>
+
+                <p className="text-[10px] text-[#786C63] text-center leading-tight">
+                  Abre o WhatsApp com a mensagem oficial e política do Espaço pronta para você revisar e enviar.
+                </p>
+              </div>
+            )}
+
+            <button
+              type="button"
+              onClick={() => {
+                setBookingWhatsAppModal(false);
+                setIsSubmittingBooking(false);
+              }}
+              className="w-full py-2.5 rounded-full bg-[#F7EFEA] hover:bg-[#E8D9B5] text-[#49382E] font-jakarta text-xs font-semibold transition-all cursor-pointer border border-[#E8D9B5]"
+            >
+              Continuar Navegando no Site
+            </button>
+          </div>
+        </div>
+      )}
+    </section>
+  );
+};
